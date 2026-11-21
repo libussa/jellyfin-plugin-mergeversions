@@ -4,6 +4,8 @@ using System.Reflection;
 using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Controllers;
@@ -19,13 +21,16 @@ namespace Jellyfin.Plugin.MergeVersions
     {
         private const string ControllerName = "Jellyfin.Api.Controllers.VideosController";
         private readonly IServiceScopeFactory _scopeFactory;
+        private readonly ILibraryManager _libraryManager;
         private readonly Lazy<(Type Controller, MethodInfo Merge, MethodInfo Split)> _actions;
 
         public JellyfinVideoVersions(
             IServiceScopeFactory scopeFactory,
-            IActionDescriptorCollectionProvider actionDescriptors)
+            IActionDescriptorCollectionProvider actionDescriptors,
+            ILibraryManager libraryManager)
         {
             _scopeFactory = scopeFactory;
+            _libraryManager = libraryManager;
             // MVC already knows the controller type from the server's assembly. Resolve it lazily,
             // after both Jellyfin and the plugin have finished registering their controllers.
             _actions = new Lazy<(Type, MethodInfo, MethodInfo)>(() =>
@@ -51,6 +56,57 @@ namespace Jellyfin.Plugin.MergeVersions
 
         public Task SplitAsync(Guid itemId, ClaimsPrincipal user, CancellationToken cancellationToken)
             => InvokeAsync(itemId, false, user, cancellationToken);
+
+        public async Task<bool> MakePrimaryAsync(
+            Guid primaryId,
+            Guid currentPrimaryId,
+            Guid[] alternateIds,
+            ClaimsPrincipal user,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (alternateIds.Length == 0 || alternateIds.Contains(primaryId))
+            {
+                throw new ArgumentException("The alternates must be the other versions of the group.", nameof(alternateIds));
+            }
+
+            // Jellyfin's merge keeps a version that already has alternates (and is no one's
+            // alternate) as the default, and otherwise picks the widest. So split the group, give
+            // the preferred version its alternates, and let Jellyfin's own merge do the rest:
+            // pointing every alternate at the default and moving playlist and collection entries.
+            await SplitAsync(currentPrimaryId, user, cancellationToken).ConfigureAwait(false);
+
+            if (_libraryManager.GetItemById(primaryId) is not Video primary)
+            {
+                return false;
+            }
+
+            primary.LinkedAlternateVersions = alternateIds
+                .Select(id => new LinkedChild { ItemId = id, Type = LinkedChildType.LinkedAlternateVersion })
+                .ToArray();
+            await primary.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+
+            var ids = new[] { primaryId }.Concat(alternateIds).ToArray();
+            await MergeAsync(ids, user, cancellationToken).ConfigureAwait(false);
+
+            return _libraryManager.GetItemById(primaryId) is Video { PrimaryVersionId: null }
+                && alternateIds.All(id => _libraryManager.GetItemById(id) is Video alternate
+                    && alternate.PrimaryVersionId == primaryId);
+        }
+
+        public async Task ClearMissingPrimaryAsync(Guid itemId, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_libraryManager.GetItemById(itemId) is not Video video
+                || !video.PrimaryVersionId.HasValue
+                || _libraryManager.GetItemById(video.PrimaryVersionId.Value) is not null)
+            {
+                return;
+            }
+
+            video.SetPrimaryVersionId(null);
+            await video.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit, cancellationToken).ConfigureAwait(false);
+        }
 
         private async Task InvokeAsync<T>(T argument, bool merge, ClaimsPrincipal user, CancellationToken cancellationToken)
         {

@@ -1,5 +1,8 @@
 using System.Security.Claims;
 using Jellyfin.Api.Controllers;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Library;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
@@ -111,17 +114,89 @@ public class JellyfinVideoVersionsTests
         var descriptors = new Mock<IActionDescriptorCollectionProvider>();
         descriptors.SetupGet(provider => provider.ActionDescriptors)
             .Returns(new ActionDescriptorCollection(Array.Empty<ActionDescriptor>(), 0));
-        var adapter = new JellyfinVideoVersions(Mock.Of<IServiceScopeFactory>(), descriptors.Object);
+        var adapter = new JellyfinVideoVersions(Mock.Of<IServiceScopeFactory>(), descriptors.Object, Mock.Of<ILibraryManager>());
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(() => adapter.SplitAsync(Guid.NewGuid(), null, default));
 
         Assert.Contains("VideosController", exception.Message);
     }
 
-    private static ServiceProvider CreateServices()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task MakePrimarySplitsLinksThePreferredVersionAndMergesWithJellyfin(bool jellyfinKeepsIt)
+    {
+        var current = new Movie { Id = Guid.NewGuid() };
+        var preferred = new Movie { Id = Guid.NewGuid(), PrimaryVersionId = current.Id };
+        var library = new Mock<ILibraryManager>();
+        library.Setup(l => l.GetItemById(current.Id)).Returns(current);
+        library.Setup(l => l.GetItemById(preferred.Id)).Returns(preferred);
+        BaseItem.LibraryManager = library.Object;
+        await using var services = CreateServices(library.Object);
+        var state = services.GetRequiredService<InvocationState>();
+        LinkedChild[] linksAtMerge = null;
+        state.Run = () =>
+        {
+            var controller = state.Controllers[^1];
+            if (controller.SplitId == current.Id)
+            {
+                preferred.PrimaryVersionId = null; // Jellyfin's split
+            }
+            else if (controller.MergedIds is not null)
+            {
+                linksAtMerge = preferred.LinkedAlternateVersions;
+                if (jellyfinKeepsIt)
+                {
+                    current.PrimaryVersionId = preferred.Id; // the version with alternates stays the default
+                }
+                else
+                {
+                    preferred.PrimaryVersionId = current.Id; // Jellyfin chose the widest anyway
+                }
+            }
+
+            return Task.FromResult<ActionResult>(new NoContentResult());
+        };
+
+        var result = await services.GetRequiredService<IVideoVersions>()
+            .MakePrimaryAsync(preferred.Id, current.Id, new[] { current.Id }, null, default);
+
+        Assert.Equal(jellyfinKeepsIt, result);
+        Assert.Equal(current.Id, state.Controllers[0].SplitId);
+        Assert.Equal(new[] { preferred.Id, current.Id }, state.Controllers[1].MergedIds);
+        var link = Assert.Single(linksAtMerge);
+        Assert.Equal(current.Id, link.ItemId);
+        Assert.Equal(LinkedChildType.LinkedAlternateVersion, link.Type);
+        library.Verify(l => l.UpdateItemAsync(preferred, It.IsAny<BaseItem>(), ItemUpdateType.MetadataEdit, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ClearMissingPrimaryOnlyClearsLinksToItemsThatAreGone()
+    {
+        var present = new Movie { Id = Guid.NewGuid() };
+        var linkedToPresent = new Movie { Id = Guid.NewGuid(), PrimaryVersionId = present.Id };
+        var orphan = new Movie { Id = Guid.NewGuid(), PrimaryVersionId = Guid.NewGuid() };
+        var library = new Mock<ILibraryManager>();
+        library.Setup(l => l.GetItemById(present.Id)).Returns(present);
+        library.Setup(l => l.GetItemById(linkedToPresent.Id)).Returns(linkedToPresent);
+        library.Setup(l => l.GetItemById(orphan.Id)).Returns(orphan);
+        BaseItem.LibraryManager = library.Object;
+        await using var services = CreateServices(library.Object);
+        var adapter = services.GetRequiredService<IVideoVersions>();
+
+        await adapter.ClearMissingPrimaryAsync(linkedToPresent.Id, default);
+        await adapter.ClearMissingPrimaryAsync(orphan.Id, default);
+
+        Assert.Equal(present.Id, linkedToPresent.PrimaryVersionId);
+        Assert.Null(orphan.PrimaryVersionId);
+        library.Verify(l => l.UpdateItemAsync(It.IsAny<BaseItem>(), It.IsAny<BaseItem>(), It.IsAny<ItemUpdateType>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    private static ServiceProvider CreateServices(ILibraryManager library = null)
     {
         var services = new ServiceCollection();
         services.AddLogging();
+        services.AddSingleton(library ?? Mock.Of<ILibraryManager>());
         services.AddSingleton<InvocationState>();
         services.AddControllers().AddApplicationPart(typeof(VideosController).Assembly).AddControllersAsServices();
         new PluginServiceRegistrator().RegisterServices(services, null);

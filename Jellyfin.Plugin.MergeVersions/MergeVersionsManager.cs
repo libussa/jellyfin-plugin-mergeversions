@@ -58,6 +58,7 @@ namespace Jellyfin.Plugin.MergeVersions
                 progress?.Report(++current / (double)duplicateMovies.Count * 100);
             }
 
+            await ApplyPreferredVersionsAsync(GetAllMovies(), user, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(100);
         }
@@ -107,6 +108,7 @@ namespace Jellyfin.Plugin.MergeVersions
                 progress?.Report(++current / (double)duplicateEpisodes.Count * 100);
             }
 
+            await ApplyPreferredVersionsAsync(episodes, user, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(100);
         }
@@ -127,6 +129,140 @@ namespace Jellyfin.Plugin.MergeVersions
 
             cancellationToken.ThrowIfCancellationRequested();
             progress?.Report(100);
+        }
+
+        /// <summary>
+        /// Makes a version from <see cref="Configuration.PluginConfiguration.PreferredLocations"/>
+        /// the default of every merged movie and episode, and clears links to default versions
+        /// that no longer exist.
+        /// </summary>
+        public async Task ApplyPreferredVersionsAsync(IProgress<double> progress, ClaimsPrincipal user = null, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var videos = GetAllMovies().Cast<Video>().Concat(GetEpisodesFromLibrary()).ToList();
+            await ApplyPreferredVersionsAsync(videos, user, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            progress?.Report(100);
+        }
+
+        private async Task ApplyPreferredVersionsAsync(IEnumerable<Video> items, ClaimsPrincipal user, CancellationToken cancellationToken)
+        {
+            var videos = items.ToList();
+
+            // A default version deleted from disk leaves its alternates pointing at nothing. They
+            // still list normally, but the merge never picks them up again because they look merged.
+            var orphans = videos
+                .Where(v => v.PrimaryVersionId.HasValue && _libraryManager.GetItemById(v.PrimaryVersionId.Value) is null)
+                .ToList();
+            foreach (var orphan in orphans)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                _logger.LogInformation("Clearing the missing default version of {Path}", orphan.Path);
+                await _videoVersions.ClearMissingPrimaryAsync(orphan.Id, cancellationToken).ConfigureAwait(false);
+            }
+
+            var preferred = GetPreferredLocations();
+            if (preferred.Length == 0)
+            {
+                return;
+            }
+
+            var defaults = videos
+                .Where(v => v.PrimaryVersionId.HasValue && !orphans.Contains(v))
+                .Select(v => v.PrimaryVersionId.Value)
+                .Distinct()
+                .ToList();
+            foreach (var defaultId in defaults)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_libraryManager.GetItemById(defaultId) is not Video current)
+                {
+                    continue;
+                }
+
+                // Every version of the group, as Jellyfin links them: regrouping a partial list
+                // would drop the versions left out of it. Leave groups with an excluded version alone.
+                var members = new List<Video> { current };
+                members.AddRange(_libraryManager.GetLinkedAlternateVersions(current).Where(v => v.Id != current.Id));
+                if (members.Count < 2 || !members.All(IsEligible))
+                {
+                    continue;
+                }
+                var chosen = ChoosePreferred(members, current, preferred, _fileSystem.ContainsSubPath);
+                if (chosen is null)
+                {
+                    continue;
+                }
+
+                var alternates = members.Where(m => m.Id != chosen.Id).Select(m => m.Id).ToArray();
+                _logger.LogInformation("Making {Path} the default version of {Name}", chosen.Path, chosen.Name);
+                if (!await _videoVersions.MakePrimaryAsync(chosen.Id, current.Id, alternates, user, cancellationToken).ConfigureAwait(false))
+                {
+                    _logger.LogWarning("Jellyfin kept another default version for {Name} ({Path})", chosen.Name, chosen.Path);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The version that should be the default of a merged group, or null to keep the current one:
+        /// the version in the highest-priority preferred folder, the widest of those on a tie. The
+        /// current default stays when it is already in the best folder any version is in.
+        /// </summary>
+        internal static Video ChoosePreferred(
+            IReadOnlyList<Video> members,
+            Video current,
+            IReadOnlyList<string> preferredLocations,
+            Func<string, string, bool> containsSubPath)
+        {
+            int Rank(Video video)
+            {
+                if (!string.IsNullOrEmpty(video.Path))
+                {
+                    for (var i = 0; i < preferredLocations.Count; i++)
+                    {
+                        if (containsSubPath(preferredLocations[i], video.Path))
+                        {
+                            return i;
+                        }
+                    }
+                }
+
+                return int.MaxValue;
+            }
+
+            var best = members.Min(Rank);
+            if (best == int.MaxValue || Rank(current) == best)
+            {
+                return null;
+            }
+
+            return members
+                .Where(m => Rank(m) == best)
+                .OrderByDescending(m => m.Width)
+                .ThenBy(m => m.Id)
+                .First();
+        }
+
+        private static string[] GetPreferredLocations()
+            => (Plugin.Instance.PluginConfiguration.PreferredLocations ?? Array.Empty<string>())
+                .Select(l => l?.Trim())
+                .Where(l => !string.IsNullOrEmpty(l))
+                .ToArray();
+
+        private List<Movie> GetAllMovies()
+        {
+            return _libraryManager
+                .GetItemList(
+                    new InternalItemsQuery
+                    {
+                        IncludeItemTypes = [BaseItemKind.Movie],
+                        IsVirtualItem = false,
+                        Recursive = true,
+                    }
+                )
+                .OfType<Movie>()
+                .Where(IsEligible)
+                .ToList();
         }
 
         private List<Movie> GetMoviesFromLibrary()

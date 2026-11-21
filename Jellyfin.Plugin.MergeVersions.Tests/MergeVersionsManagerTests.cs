@@ -1,3 +1,4 @@
+using Jellyfin.Data.Enums;
 using System.Security.Claims;
 using Jellyfin.Plugin.MergeVersions.Api;
 using Jellyfin.Plugin.MergeVersions.Configuration;
@@ -181,6 +182,7 @@ public class MergeVersionsManagerTests
         var items = new List<BaseItem> { primary, secondary };
         var library = new Mock<ILibraryManager>(MockBehavior.Strict);
         library.Setup(l => l.GetItemList(It.IsAny<InternalItemsQuery>())).Returns(items);
+        library.Setup(l => l.GetItemById(primary.Id)).Returns(primary);
 
         var manager = new MergeVersionsManager(library.Object, NullLogger<MergeVersionsManager>.Instance,
             Mock.Of<IFileSystem>(), versions.Object);
@@ -197,6 +199,204 @@ public class MergeVersionsManagerTests
         var authorization = Assert.Single(typeof(MergeVersionsController)
             .GetCustomAttributes(typeof(AuthorizeAttribute), true).Cast<AuthorizeAttribute>());
         Assert.Equal(Policies.RequiresElevation, authorization.Policy);
+    }
+
+    private const string Hd = "/media/movies";
+    private const string Uhd = "/media/movies4k";
+
+    [Fact]
+    public void ChoosePreferredPicksTheVersionInTheFirstPreferredFolder()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920);
+
+        Assert.Same(hd, MergeVersionsManager.ChoosePreferred(new[] { uhd, hd }, uhd, new[] { Hd }, StartsWith));
+    }
+
+    [Fact]
+    public void ChoosePreferredKeepsADefaultThatIsAlreadyPreferred()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920);
+
+        Assert.Null(MergeVersionsManager.ChoosePreferred(new[] { hd, uhd }, hd, new[] { Hd }, StartsWith));
+    }
+
+    [Fact]
+    public void ChoosePreferredKeepsJellyfinsChoiceWhenNoVersionIsPreferred()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920);
+
+        Assert.Null(MergeVersionsManager.ChoosePreferred(new[] { uhd, hd }, uhd, new[] { "/media/other" }, StartsWith));
+    }
+
+    [Fact]
+    public void ChoosePreferredFollowsThePriorityOrder()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920);
+
+        Assert.Same(uhd, MergeVersionsManager.ChoosePreferred(new[] { hd, uhd }, hd, new[] { Uhd, Hd }, StartsWith));
+    }
+
+    [Fact]
+    public void ChoosePreferredTakesTheWidestOfTheBestFolder()
+    {
+        var current = Movie(Uhd, 3840);
+        var sd = Movie(Hd, 720);
+        var hd = Movie(Hd, 1920);
+
+        Assert.Same(hd, MergeVersionsManager.ChoosePreferred(new[] { current, sd, hd }, current, new[] { Hd }, StartsWith));
+    }
+
+    [Fact]
+    public async Task ApplyMakesThePreferredVersionTheDefault()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920, primary: uhd);
+        var (manager, versions, _) = CreatePreferenceManager(new[] { Hd }, new[] { uhd, hd }, (uhd, new[] { hd }));
+        versions.Setup(v => v.MakePrimaryAsync(hd.Id, uhd.Id, new[] { uhd.Id }, null, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        versions.Verify(v => v.MakePrimaryAsync(hd.Id, uhd.Id, new[] { uhd.Id }, null, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ApplyDoesNothingWithoutPreferredFolders()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920, primary: uhd);
+        var (manager, versions, _) = CreatePreferenceManager(Array.Empty<string>(), new[] { uhd, hd }, (uhd, new[] { hd }));
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        Assert.Empty(versions.Invocations);
+    }
+
+    [Fact]
+    public async Task ApplyLeavesGroupsWithAnExcludedVersionAlone()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920, primary: uhd);
+        var (manager, versions, _) = CreatePreferenceManager(new[] { Hd }, new[] { uhd, hd }, (uhd, new[] { hd }));
+        Plugin.Instance.PluginConfiguration.LocationsExcluded = new[] { Uhd };
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        Assert.Empty(versions.Invocations);
+    }
+
+    [Fact]
+    public async Task ApplyRegroupsEveryLinkedVersionEvenOnesItDidNotList()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920, primary: uhd);
+        var other = Movie("/media/extra", 1280, primary: uhd);
+        // Only the 1080p copy is listed; the third version is known through Jellyfin's links.
+        var (manager, versions, _) = CreatePreferenceManager(new[] { Hd }, new[] { hd }, (uhd, new[] { hd, other }));
+        versions.Setup(v => v.MakePrimaryAsync(hd.Id, uhd.Id, It.IsAny<Guid[]>(), null, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        var alternates = Assert.IsType<Guid[]>(Assert.Single(versions.Invocations).Arguments[2]);
+        Assert.Equal(new[] { uhd.Id, other.Id }.OrderBy(i => i), alternates.OrderBy(i => i));
+    }
+
+    [Fact]
+    public async Task ApplyClearsLinksToMissingDefaults()
+    {
+        var hd = Movie(Hd, 1920);
+        hd.PrimaryVersionId = Guid.NewGuid();
+        var (manager, versions, _) = CreatePreferenceManager(new[] { Hd }, new[] { hd });
+        versions.Setup(v => v.ClearMissingPrimaryAsync(hd.Id, It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        versions.Verify(v => v.ClearMissingPrimaryAsync(hd.Id, It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Single(versions.Invocations);
+    }
+
+    [Fact]
+    public async Task ApplyContinuesWhenJellyfinKeepsAnotherDefault()
+    {
+        var first = Movie(Uhd, 3840);
+        var firstHd = Movie(Hd, 1920, primary: first);
+        var second = Movie(Uhd + "/b", 3840);
+        var secondHd = Movie(Hd + "/b", 1920, primary: second);
+        var (manager, versions, _) = CreatePreferenceManager(
+            new[] { Hd }, new[] { first, firstHd, second, secondHd }, (first, new[] { firstHd }), (second, new[] { secondHd }));
+        versions.Setup(v => v.MakePrimaryAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<Guid[]>(), null, It.IsAny<CancellationToken>())).ReturnsAsync(false);
+
+        await manager.ApplyPreferredVersionsAsync(null);
+
+        Assert.Equal(2, versions.Invocations.Count);
+    }
+
+    [Fact]
+    public async Task MergingMoviesAppliesThePreferenceAfterwards()
+    {
+        var uhd = Movie(Uhd, 3840);
+        var hd = Movie(Hd, 1920);
+        uhd.ProviderIds["Tmdb"] = hd.ProviderIds["Tmdb"] = "438631";
+        var (manager, versions, _) = CreatePreferenceManager(new[] { Hd }, new[] { uhd, hd }, (uhd, new[] { hd }));
+        versions.Setup(v => v.MergeAsync(It.IsAny<Guid[]>(), null, It.IsAny<CancellationToken>()))
+            .Callback(() => hd.PrimaryVersionId = uhd.Id) // Jellyfin picks the widest
+            .Returns(Task.CompletedTask);
+        versions.Setup(v => v.MakePrimaryAsync(hd.Id, uhd.Id, new[] { uhd.Id }, null, It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        await manager.MergeMoviesAsync(null);
+
+        Assert.Equal(new[] { "MergeAsync", "MakePrimaryAsync" }, versions.Invocations.Select(i => i.Method.Name));
+    }
+
+    private static bool StartsWith(string parent, string path) => path.StartsWith(parent + "/", StringComparison.Ordinal);
+
+    private static Movie Movie(string folder, int width, Movie primary = null)
+    {
+        var movie = new Movie { Id = Guid.NewGuid(), Name = "Dune", Path = folder + "/" + Guid.NewGuid().ToString("N") + ".mkv", Width = width };
+        if (primary is not null)
+        {
+            movie.PrimaryVersionId = primary.Id;
+        }
+
+        return movie;
+    }
+
+    private static (MergeVersionsManager Manager, Mock<IVideoVersions> Versions, Mock<ILibraryManager> Library) CreatePreferenceManager(
+        string[] preferred,
+        IEnumerable<Movie> listed,
+        params (Movie Primary, Movie[] Alternates)[] groups)
+    {
+        var paths = new Mock<IServerApplicationPaths>();
+        paths.SetupGet(p => p.PluginsPath).Returns(AppContext.BaseDirectory);
+        _ = new TestPlugin(paths.Object);
+        Plugin.Instance.PluginConfiguration.PreferredLocations = preferred;
+
+        var library = new Mock<ILibraryManager>(MockBehavior.Strict);
+        var items = listed.ToList();
+        library.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.IncludeItemTypes.Contains(BaseItemKind.Movie))))
+            .Returns(() => items.Cast<BaseItem>().ToList());
+        library.Setup(l => l.GetItemList(It.Is<InternalItemsQuery>(q => q.IncludeItemTypes.Contains(BaseItemKind.Episode))))
+            .Returns(new List<BaseItem>());
+        library.Setup(l => l.GetItemById(It.IsAny<Guid>())).Returns((BaseItem)null);
+        foreach (var (primary, alternates) in groups)
+        {
+            foreach (var video in alternates.Append(primary))
+            {
+                library.Setup(l => l.GetItemById(video.Id)).Returns(video);
+            }
+
+            library.Setup(l => l.GetLinkedAlternateVersions(primary)).Returns(alternates);
+        }
+
+        var fileSystem = new Mock<IFileSystem>();
+        fileSystem.Setup(f => f.ContainsSubPath(It.IsAny<string>(), It.IsAny<string>()))
+            .Returns<string, string>(StartsWith);
+        var versions = new Mock<IVideoVersions>(MockBehavior.Strict);
+        var manager = new MergeVersionsManager(library.Object, NullLogger<MergeVersionsManager>.Instance, fileSystem.Object, versions.Object);
+        return (manager, versions, library);
     }
 
     private static MergeVersionsManager CreateManager(bool movies, Mock<IVideoVersions> versions, int groups = 1)

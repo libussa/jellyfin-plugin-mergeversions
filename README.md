@@ -6,6 +6,35 @@ Jellyfin Merge Versions plugin is a plugin that automatically groups every repea
 
 </p>
 
+## About this fork
+
+This fork adds a **preferred default version**, which upstream cannot offer since it
+switched to Jellyfin's own merge ([#72](https://github.com/danieladov/jellyfin-plugin-mergeversions/issues/72),
+[#97](https://github.com/danieladov/jellyfin-plugin-mergeversions/pull/97)). Jellyfin always makes the widest
+file the default version of a merged item, so 4K copies play by default even on clients that
+have to transcode them. Jellyfin issue [#17664](https://github.com/jellyfin/jellyfin/issues/17664)
+asks for a way to choose.
+
+- **Preferred folders** (plugin settings), one per line, highest priority first. A merged item
+  plays its version from the first of these folders by default; the other versions stay in its
+  version menu. Items with no version in these folders keep Jellyfin's choice.
+- The merge tasks apply the preference after merging. **Apply Preferred Default Versions**
+  (scheduled task, or the button in the settings) applies it to everything already merged.
+- Versions whose default version was deleted from disk are unlinked, so they stand alone and
+  can be merged again.
+
+How it sets the default: it splits the group, links the other versions to the preferred one,
+and calls Jellyfin's own merge, which keeps a version that already has alternates as the
+default. Jellyfin still does the rest, including moving playlist and collection entries to the
+new default. It checks the result and logs a warning if Jellyfin chose another default.
+
+A merged item shows the watched state of its default version. Check that history on the old
+default versions is also on the new ones before applying the preference.
+
+This fork has its own plugin ID and name ("Merge Versions (Preferred Default)"), so it is
+never replaced by an update of the upstream plugin. Remove the upstream plugin before
+installing it: both register the same API routes. It reads the upstream plugin's settings file.
+
 ## Install Process
 
 

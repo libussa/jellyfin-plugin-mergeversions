@@ -29,8 +29,22 @@
                     </div>
 
 
+                    <div class="inputContainer">
+                        <h3>Preferred default version</h3>
+                        <textarea is="emby-textarea" id="txtPreferredLocations" rows="4"
+                            style="width:100%;font-family:monospace;"></textarea>
+                        <div class="fieldDescription">One folder per line, highest priority first, for example
+                            <code>/mnt/media/movies</code>. A merged item plays its version from the first folder in
+                            this list by default; the other versions stay in its version menu. Items with no version in
+                            these folders keep Jellyfin's choice (the widest). Leave empty to always keep Jellyfin's choice.
+                            After changing this, save, then run "Apply Preferred Default Versions".</div>
+                    </div>
+
                     <button is="emby-button" type="button" class="raised button-submit block emby-button"
                         id="refresh-library" onclick=save()><span>Save</span></button>
+
+                    <button is="emby-button" type="button" class="raised block" id="apply-preferred"
+                        onclick=applyPreferred()><span>Apply Preferred Default Versions</span></button>
 
                     <button is="emby-button" type="button" class="raised block" id="refresh-library"
                         onclick=mergeMovies()><span>Merge All Movies</span></button>
@@ -50,7 +64,7 @@
 
 
 
-            var pluginId = "f21bbed8-3a97-4d8b-88b2-48aaa65427cb";
+            var pluginId = "d732e032-a5a4-4ec5-bdfc-a973a7c3f795";
 
 
             function mergeMovies() {
@@ -83,6 +97,20 @@
                 });
             }
 
+
+            function applyPreferred() {
+                var request = {
+                    url: ApiClient.getUrl('MergeVersions/ApplyPreferredVersions'),
+                    type: 'POST'
+                };
+                ApiClient.fetch(request).then(function () {
+                    Dashboard.alert("Preferred default versions applied");
+                }).catch(function () {
+                    Dashboard.alert({
+                        message: "Unexpected error occurred!"
+                    });
+                });
+            }
 
             function splitMovies() {
                 var request = {
@@ -119,6 +147,8 @@
                 if (!config) {
                     config.LocationsExcluded = [];
                 }
+
+                document.querySelector('#txtPreferredLocations').value = (config.PreferredLocations || []).join('\n');
 
                 ApiClient.getVirtualFolders().then(function (virtualFolders) {
                     loadVirtualFolders(config, virtualFolders);
@@ -171,6 +201,10 @@
 
                 ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                     config.LocationsExcluded = folders;
+                    config.PreferredLocations = document.querySelector('#txtPreferredLocations').value
+                        .split('\n')
+                        .map(function (line) { return line.trim(); })
+                        .filter(function (line) { return line.length > 0; });
                     ApiClient.updatePluginConfiguration(pluginId, config).then(function (res) {
                         Dashboard.processPluginConfigurationUpdateResult(res);
                     });

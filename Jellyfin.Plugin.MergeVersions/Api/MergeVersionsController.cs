@@ -49,6 +49,21 @@ namespace Jellyfin.Plugin.MergeVersions.Api
         }
 
         /// <summary>
+        /// Makes a version from the preferred folders the default of every merged movie and episode.
+        /// </summary>
+        /// <reponse code="204">Preferred default versions applied.</response>
+        /// <returns>A <see cref="NoContentResult"/> indicating success.</returns>
+        [HttpPost("ApplyPreferredVersions")]
+        [ProducesResponseType(StatusCodes.Status204NoContent)]
+        public async Task<ActionResult> ApplyPreferredVersionsRequestAsync()
+        {
+            _logger.LogInformation("Applying preferred default versions");
+            await _mergeVersionsManager.ApplyPreferredVersionsAsync(null, User, HttpContext.RequestAborted);
+            _logger.LogInformation("Applied preferred default versions");
+            return NoContent();
+        }
+
+        /// <summary>
         /// Scans all movies and splits merged ones.
         /// </summary>
         /// <reponse code="204">Library scan and split started successfully. </response>

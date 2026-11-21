@@ -97,4 +97,35 @@ namespace Jellyfin.Plugin.MergeVersions.ScheduledTasks
         public string Description => "Merges all repeated episodes";
         public string Category => "Merge Versions";
     }
+
+    public class ApplyPreferredVersionsTask : IScheduledTask
+    {
+        private readonly ILogger _logger;
+        private readonly MergeVersionsManager _mergeVersionsManager;
+
+        public ApplyPreferredVersionsTask(
+            MergeVersionsManager mergeVersionsManager,
+            ILogger<MergeVersionsManager> logger
+        )
+        {
+            _logger = logger;
+            _mergeVersionsManager = mergeVersionsManager;
+        }
+
+        public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("Applying preferred default versions");
+            await _mergeVersionsManager.ApplyPreferredVersionsAsync(progress, cancellationToken: cancellationToken);
+            _logger.LogInformation("Applied preferred default versions");
+        }
+
+        // The merge tasks already apply the preference after merging. Run this one by hand after
+        // changing the preferred folders.
+        public IEnumerable<TaskTriggerInfo> GetDefaultTriggers() => Array.Empty<TaskTriggerInfo>();
+
+        public string Name => "Apply Preferred Default Versions";
+        public string Key => "ApplyPreferredVersionsTask";
+        public string Description => "Makes a version from the preferred folders the default of every merged movie and episode";
+        public string Category => "Merge Versions";
+    }
 }
